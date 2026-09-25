@@ -15,7 +15,21 @@ export interface ArchiveRecord {
   rights: string;
   notes: string;
   updatedAt: string;
-  status: 'unreviewed' | 'confirmed' | 'rejected' | 'merged';
+  status: 'unreviewed' | 'confirmed' | 'rejected' | 'merged' | 'revised';
+  revisions: RevisionEntry[];
+}
+
+export interface FieldChange {
+  field: FieldKey;
+  before: string;
+  after: string;
+}
+
+export interface RevisionEntry {
+  id: string;
+  at: string;
+  source: string;
+  changes: FieldChange[];
 }
 
 export interface MatchCandidate {

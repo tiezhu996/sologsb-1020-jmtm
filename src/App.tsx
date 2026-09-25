@@ -2,8 +2,8 @@ import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
-import { computeMatches, fieldValue, scorePair } from './utils/matching';
+import type { ArchiveRecord, ArchiveState, FieldChange, FieldKey, MatchCandidate, RecordGroup } from './types';
+import { fieldValue, reconcileMatches } from './utils/matching';
 import { seedState } from './data/seed';
 
 const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
@@ -25,6 +25,58 @@ const matchLabel = (state: ArchiveState, match: MatchCandidate) => {
   return `${left?.title ?? '未知记录'} ↔ ${right?.title ?? '未知记录'}`;
 };
 
+const splitList = (value: unknown) => (Array.isArray(value)
+  ? value.map((item) => String(item).trim()).filter(Boolean)
+  : String(value ?? '').split(/[，,、]/).map((item) => item.trim()).filter(Boolean));
+
+const fieldLabelOf = (field: FieldKey) => fieldLabels.find(([key]) => key === field)?.[1] ?? field;
+
+const buildIncoming = (row: Partial<ArchiveRecord>, group: RecordGroup, index: number): ArchiveRecord => ({
+  id: crypto.randomUUID(),
+  group,
+  title: row.title?.trim() || `未命名记录 ${index + 1}`,
+  date: row.date?.trim() ?? '',
+  people: splitList(row.people),
+  places: splitList(row.places),
+  identifier: row.identifier?.trim() ?? '',
+  medium: row.medium?.trim() ?? '',
+  extent: row.extent?.trim() ?? '',
+  rights: row.rights?.trim() ?? '',
+  notes: row.notes?.trim() ?? '',
+  updatedAt: new Date().toISOString(),
+  status: 'unreviewed',
+  revisions: []
+});
+
+const diffRecord = (current: ArchiveRecord, incoming: ArchiveRecord): FieldChange[] => {
+  const changes: FieldChange[] = [];
+  fieldLabels.forEach(([field]) => {
+    const before = fieldValue(current, field);
+    const after = fieldValue(incoming, field);
+    if (before !== after) changes.push({ field, before, after });
+  });
+  return changes;
+};
+
+const parseRows = (raw: string): Array<Partial<ArchiveRecord>> | undefined => {
+  if (raw.startsWith('[')) return JSON.parse(raw) as Array<Partial<ArchiveRecord>>;
+  type RawRow = { [K in FieldKey]?: string };
+  return raw.split(/\r?\n/).filter(Boolean).map((line): RawRow => {
+    const cells = line.split(/\t|\|/).map((cell) => cell.trim());
+    return {
+      title: cells[0] || '',
+      date: cells[1] || '',
+      people: cells[2] || '',
+      places: cells[3] || '',
+      identifier: cells[4] || '',
+      medium: cells[5] || '',
+      extent: cells[6] || '',
+      rights: cells[7] || '',
+      notes: cells[8] || ''
+    };
+  }) as Array<Partial<ArchiveRecord>>;
+};
+
 export default component$(() => {
   const state = useStore<ArchiveState>(seedState());
   const history = useSignal<string[]>([]);
@@ -37,8 +89,10 @@ export default component$(() => {
   const importOpen = useSignal(false);
   const mergeOpen = useSignal(false);
   const importGroup = useSignal<RecordGroup>('A');
+  const importMode = useSignal<'revision' | 'append'>('revision');
   const importRaw = useSignal('');
   const importText = useSignal('');
+  const importError = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
 
@@ -58,7 +112,7 @@ export default component$(() => {
   const restore = (raw: string) => {
     const next = JSON.parse(raw) as Partial<ArchiveState>;
     state.revision = next.revision ?? state.revision;
-    state.records = next.records ?? state.records;
+    state.records = (next.records ?? state.records).map((record) => ({ ...record, revisions: record.revisions ?? [] }));
     state.matches = next.matches ?? state.matches;
     state.merges = next.merges ?? state.merges;
     state.audit = next.audit ?? state.audit;
@@ -199,56 +253,94 @@ export default component$(() => {
   const parseImport = $(() => {
     const raw = importRaw.value.trim();
     if (!raw) return;
-    let rows: Array<Partial<ArchiveRecord>> = [];
+    importError.value = '';
+    let rows: Array<Partial<ArchiveRecord>>;
     try {
-      if (raw.startsWith('[')) rows = JSON.parse(raw) as Array<Partial<ArchiveRecord>>;
-      else {
-        const lines = raw.split(/\r?\n/).filter(Boolean);
-        rows = lines.map((line, index) => {
-          const cells = line.split(/\t|\|/).map((cell) => cell.trim());
-          return {
-            title: cells[0] || `未命名记录 ${index + 1}`,
-            date: cells[1] || '',
-            people: (cells[2] || '').split(/[，,、]/).filter(Boolean),
-            places: (cells[3] || '').split(/[，,、]/).filter(Boolean),
-            identifier: cells[4] || '',
-            medium: cells[5] || '',
-            extent: cells[6] || '',
-            rights: cells[7] || '',
-            notes: cells[8] || ''
-          };
-        });
-      }
+      const parsed = parseRows(raw);
+      if (!parsed) return;
+      rows = parsed;
     } catch {
-      notify('导入内容格式不正确，请使用 JSON 数组或制表符分隔文本');
+      importError.value = '导入内容格式不正确，请使用 JSON 数组或制表符 / 竖线分隔文本。';
       return;
     }
-    if (!rows.length) return;
+    if (!rows.length) {
+      importError.value = '文件中没有可导入的记录行。';
+      return;
+    }
+
+    // 修订模式：同一文件内（同分组）编号重复时，整份修订先不进入工作台。
+    if (importMode.value === 'revision') {
+      const seen = new Map<string, number[]>();
+      rows.forEach((row, index) => {
+        const identifier = row.identifier?.trim() ?? '';
+        if (!identifier) return;
+        const key = `${importGroup.value}|${identifier}`;
+        seen.set(key, [...seen.get(key) ?? [], index + 1]);
+      });
+      const duplicates = [...seen.entries()].filter(([, lines]) => lines.length > 1);
+      if (duplicates.length) {
+        importError.value = `整份修订未导入：文件内有 ${duplicates.length} 组重复的${importGroup.value} 组编号——`
+          + duplicates.map(([key, lines]) => `编号 ${key.split('|')[1]} 出现在第 ${lines.join('、')} 行`).join('；') + '。请先消除重复再导入。';
+        return;
+      }
+    }
+
     capture();
-    rows.forEach((row) => {
-      const record: ArchiveRecord = {
-        id: crypto.randomUUID(),
-        group: importGroup.value,
-        title: row.title || '未命名记录',
-        date: row.date || '',
-        people: Array.isArray(row.people) ? row.people : String(row.people || '').split(/[，,、]/).filter(Boolean),
-        places: Array.isArray(row.places) ? row.places : String(row.places || '').split(/[，,、]/).filter(Boolean),
-        identifier: row.identifier || '',
-        medium: row.medium || '',
-        extent: row.extent || '',
-        rights: row.rights || '',
-        notes: row.notes || '',
-        updatedAt: new Date().toISOString(),
-        status: 'unreviewed'
-      };
-      state.records.push(record);
-    });
-    state.matches = computeMatches(state.records);
-    commit('导入档案记录', `从 ${importGroup.value} 组导入 ${rows.length} 条记录`, []);
+    const incoming = rows.map((row, index) => buildIncoming(row, importGroup.value, index));
+    let updated = 0;
+    let unchanged = 0;
+    let added = 0;
+    let changedFields = 0;
+    const touched = new Set<string>();
+
+    if (importMode.value === 'revision') {
+      const existingByIdentifier = new Map<string, ArchiveRecord>();
+      state.records.forEach((record) => {
+        if (record.group === importGroup.value && record.identifier) {
+          existingByIdentifier.set(`${record.group}|${record.identifier}`, record);
+        }
+      });
+      incoming.forEach((candidate) => {
+        if (!candidate.identifier) { added += 1; state.records.push(candidate); return; }
+        const target = existingByIdentifier.get(`${candidate.group}|${candidate.identifier}`);
+        if (!target) { added += 1; state.records.push(candidate); return; }
+        const changes = diffRecord(target, candidate);
+        if (!changes.length) { unchanged += 1; return; }
+        fieldLabels.forEach(([field]) => {
+          if (field === 'people' || field === 'places') (target[field] as string[]) = candidate[field] as string[];
+          else (target[field] as string) = candidate[field] as string;
+        });
+        target.updatedAt = new Date().toISOString();
+        if (target.status !== 'merged') target.status = 'revised';
+        target.revisions.unshift({
+          id: crypto.randomUUID(),
+          at: target.updatedAt,
+          source: importText.value || `第 ${importGroup.value} 组修订表`,
+          changes
+        });
+        changedFields += changes.length;
+        updated += 1;
+        touched.add(target.id);
+      });
+    } else {
+      incoming.forEach((record) => { state.records.push(record); added += 1; });
+    }
+
+    state.matches = importMode.value === 'revision'
+      ? reconcileMatches(state.records, state.matches, touched)
+      : reconcileMatches(state.records, state.matches, new Set(incoming.map((record) => record.id)));
+
+    if (importMode.value === 'revision') {
+      commit('导入修订表', `按分组与编号比对 ${rows.length} 行：更新 ${updated} 条（${changedFields} 个字段）、新增 ${added} 条、无变化沿用结论 ${unchanged} 条；受影响匹配已退回待复核`, [...touched]);
+      notify(`修订已套用：更新 ${updated} 条、新增 ${added} 条、${unchanged} 条无变化`);
+    } else {
+      commit('导入档案记录', `从 ${importGroup.value} 组整批新增 ${added} 条记录并重新匹配`, []);
+      notify(`已新增 ${added} 条记录并重新匹配`);
+    }
     importRaw.value = '';
     importText.value = '';
+    importError.value = '';
     importOpen.value = false;
-    notify(`已导入 ${rows.length} 条记录并重新匹配`);
   });
 
   const importFile = $(async (_event: Event, element: HTMLInputElement) => {
@@ -256,6 +348,7 @@ export default component$(() => {
     if (!file) return;
     importRaw.value = await file.text();
     importText.value = file.name;
+    importError.value = '';
   });
 
   const exportAudit = $(() => {
@@ -416,10 +509,32 @@ export default component$(() => {
             {filteredRecords.value.map((record) => (
               <div class="table-row" key={record.id}>
                 <span class={`group-badge ${record.group.toLowerCase()}`}>{record.group}</span>
-                <strong>{record.title}</strong>
+                <strong>
+                  <span class="record-title-line">{record.title}
+                    {record.revisions.length > 0 && <em class="revision-badge" title={`共 ${record.revisions.length} 次修订`}>修订 ×{record.revisions.length}</em>}
+                  </span>
+                  {record.revisions.length > 0 && (
+                    <details class="revision-log">
+                      <summary>查看改前 / 改后（{record.revisions.length} 次）</summary>
+                      {record.revisions.slice(0, 3).map((revision) => (
+                        <dl class="revision-entry" key={revision.id}>
+                          <dt>{new Date(revision.at).toLocaleString('zh-CN')} · {revision.source}</dt>
+                          {revision.changes.map((change) => (
+                            <dd key={change.field}>
+                              <b>{fieldLabelOf(change.field)}</b>
+                              <s>{change.before || '（空）'}</s>
+                              <i>→</i>
+                              <u>{change.after || '（空）'}</u>
+                            </dd>
+                          ))}
+                        </dl>
+                      ))}
+                    </details>
+                  )}
+                </strong>
                 <span>{parseDate(record.date)}<small>{record.people.join('、')} · {record.places.join('、')}</small></span>
                 <code>{record.identifier}</code>
-                <span class={`record-status ${record.status}`}>{record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : '已合并'}</span>
+                <span class={`record-status ${record.status}`}>{record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : record.status === 'revised' ? '已修订' : '已合并'}</span>
               </div>
             ))}
           </div>
@@ -466,9 +581,11 @@ export default component$(() => {
         <article class="panel explanation-panel">
           <div class="panel-heading"><div><span class="eyebrow">METHOD</span><h3>匹配与保护规则</h3></div></div>
           <p>标题、日期、人物、地点和编号按权重综合评分。低于 68% 的候选会以红色标记，但系统不会替研究者自动决定。</p>
-          <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
-          <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
-          <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
+          <div class="rule-row"><span>1</span><p>修订表按「分组 + 编号」定位原记录，只写入有差异的字段；改前改后内容保留在记录旁。</p></div>
+          <div class="rule-row"><span>2</span><p>字段有变化的匹配退回待复核，完全没变的配对继续沿用确认 / 忽略 / 合并结论；新编号直接新增。</p></div>
+          <div class="rule-row"><span>3</span><p>同一文件出现重复分组编号时整份拒收并指出所在行，不会写入任何半成品数据。</p></div>
+          <div class="rule-row"><span>4</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接；原始记录、合并结果和忽略动作都进入本地审计轨迹。</p></div>
+          <div class="rule-row"><span>5</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
         </article>
       </section>
 
@@ -476,16 +593,31 @@ export default component$(() => {
 
       <Modal.Root bind:show={importOpen} closeOnBackdropClick>
         <Modal.Panel class="modal-panel import-modal">
-          <Modal.Header class="modal-header"><div><span class="eyebrow">IMPORT</span><Modal.Title>导入一组档案记录</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
-          <Modal.Description class="modal-description">支持 JSON 数组或制表符 / 竖线分隔文本。字段顺序：标题、日期、人物、地点、编号、载体、数量、权利、备注。</Modal.Description>
+          <Modal.Header class="modal-header"><div><span class="eyebrow">IMPORT</span><Modal.Title>导入档案记录</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
+          <Modal.Description class="modal-description">
+            {importMode.value === 'revision'
+              ? '修订模式：按「分组 + 编号」对应到原记录，只写入有差异的字段，并在记录旁保留改前 / 改后内容。发生变化的匹配退回待复核，无变化的结论继续沿用；新编号自动新增到工作台。同一文件内出现重复分组编号时整份拒收。'
+              : '整批新增模式：文件中的每一行都作为新记录追加，并重新计算全部候选匹配。'}
+            <br />支持 JSON 数组或制表符 / 竖线分隔文本。字段顺序：标题、日期、人物、地点、编号、载体、数量、权利、备注。
+          </Modal.Description>
+          <div class="import-controls import-modes">
+            <label class={`radio-card ${importMode.value === 'revision' ? 'mode-on' : ''}`}><input type="radio" checked={importMode.value === 'revision'} onChange$={() => importMode.value = 'revision'} /><span><strong>修订比对</strong><small>按分组+编号定位原记录，只写差异字段</small></span></label>
+            <label class={`radio-card ${importMode.value === 'append' ? 'mode-on' : ''}`}><input type="radio" checked={importMode.value === 'append'} onChange$={() => importMode.value = 'append'} /><span><strong>整批新增</strong><small>全部追加为新记录</small></span></label>
+          </div>
           <div class="import-controls">
             <label class="radio-card"><input type="radio" checked={importGroup.value === 'A'} onChange$={() => importGroup.value = 'A'} /><span><strong>A 组</strong><small>口述史 / 主要记录</small></span></label>
             <label class="radio-card"><input type="radio" checked={importGroup.value === 'B'} onChange$={() => importGroup.value = 'B'} /><span><strong>B 组</strong><small>手稿 / 待合并记录</small></span></label>
             <label class="file-button">选择文件<input type="file" accept=".json,.txt,.csv,.tsv" onChange$={(event, element) => importFile(event, element)} /></label>
           </div>
-          <textarea class="modal-textarea" value={importRaw.value} onInput$={(event) => importRaw.value = (event.target as HTMLTextAreaElement).value} placeholder="李秀珍口述史访谈 | 2019-04-12 | 李秀珍、周明远 | 临河县 | OH-LXZ-2019-01 | 数字录音 | 02:14:38 | 研究者授权 | ..." />
-          {importText.value && <div class="file-name">已读取：{importText.value}</div>}
-          <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" disabled={!importRaw.value.trim()} onClick$={parseImport}>导入并重新匹配</button></Modal.Footer>
+          <textarea
+            class="modal-textarea"
+            value={importRaw.value}
+            onInput$={(event) => { importRaw.value = (event.target as HTMLTextAreaElement).value; importError.value = ''; }}
+            placeholder="李秀珍口述史访谈 | 2019-04-12 | 李秀珍、周明远 | 临河县 | OH-LXZ-2019-01 | 数字录音 | 02:14:38 | 研究者授权 | ..."
+          />
+          {importError.value && <div class="import-error" role="alert">⚠ {importError.value}</div>}
+          {importText.value && !importError.value && <div class="file-name">已读取：{importText.value}</div>}
+          <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" disabled={!importRaw.value.trim()} onClick$={parseImport}>{importMode.value === 'revision' ? '按修订比对导入' : '整批导入'}</button></Modal.Footer>
         </Modal.Panel>
       </Modal.Root>
 

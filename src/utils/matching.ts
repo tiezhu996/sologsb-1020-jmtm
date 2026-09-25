@@ -87,6 +87,28 @@ export function computeMatches(records: ArchiveRecord[]): MatchCandidate[] {
   return matches.sort((a, b) => b.score - a.score);
 }
 
+/**
+ * 修订导入后重新计算候选：保留每条仍存在的配对，沿用最新分数与依据；
+ * 若配对两侧记录均未被本次修订触动，继续沿用既有结论（确认 / 忽略 / 合并），
+ * 只要任一侧发生字段变化或属于全新配对，就退回待复核。
+ */
+export function reconcileMatches(
+  records: ArchiveRecord[],
+  previous: MatchCandidate[],
+  touchedRecordIds: ReadonlySet<string>
+): MatchCandidate[] {
+  const previousByPair = new Map(previous.map((match) => [`${match.leftId}|${match.rightId}`, match]));
+  return computeMatches(records).map((match) => {
+    const prior = previousByPair.get(`${match.leftId}|${match.rightId}`);
+    // 合并结论不可自动撤销：记录已物理合并，无法退回候选状态。
+    if (prior?.status === 'merged') return { ...match, status: 'merged', reviewedAt: prior.reviewedAt };
+    if (!prior || touchedRecordIds.has(match.leftId) || touchedRecordIds.has(match.rightId)) {
+      return match;
+    }
+    return { ...match, status: prior.status, reviewedAt: prior.reviewedAt };
+  });
+}
+
 export function fieldValue(record: ArchiveRecord, field: FieldKey): string {
   return displayValue(record, field);
 }

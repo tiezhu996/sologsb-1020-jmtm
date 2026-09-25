@@ -18,7 +18,8 @@ const makeRecord = (
 ): ArchiveRecord => ({
   id, group, title, date, people, places, identifier, medium, extent, rights, notes,
   updatedAt: now,
-  status: 'unreviewed'
+  status: 'unreviewed',
+  revisions: []
 });
 
 export const seedRecords = (): ArchiveRecord[] => [

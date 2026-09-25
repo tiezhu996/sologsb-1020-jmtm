@@ -3,7 +3,9 @@ import {
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
 import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
-import { computeMatches, fieldValue, scorePair } from './utils/matching';
+import { fieldValue } from './utils/matching';
+import { applyUpdate, normalizeRow, planRevision, rematchAffected } from './utils/revision';
+import type { RevisionDuplicate, RevisionRow } from './utils/revision';
 import { seedState } from './data/seed';
 
 const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
@@ -11,6 +13,7 @@ const fieldLabels: Array<[FieldKey, string]> = [
   ['title', '标题'], ['date', '日期'], ['people', '人物'], ['places', '地点'], ['identifier', '编号'],
   ['medium', '载体'], ['extent', '数量'], ['rights', '权利'], ['notes', '备注']
 ];
+const fieldLabel = (field: FieldKey) => fieldLabels.find(([key]) => key === field)?.[1] ?? field;
 
 const parseDate = (value: string) => {
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value.split('-').reverse().join('/');
@@ -39,6 +42,8 @@ export default component$(() => {
   const importGroup = useSignal<RecordGroup>('A');
   const importRaw = useSignal('');
   const importText = useSignal('');
+  const importDuplicates = useSignal<RevisionDuplicate[]>([]);
+  const expandedRecordId = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
 
@@ -69,9 +74,9 @@ export default component$(() => {
     window.setTimeout(() => { if (toast.value === message) toast.value = ''; }, 2800);
   };
 
-  const commit = (action: string, detail: string, recordIds: string[] = []) => {
+  const commit = (action: string, detail: string, recordIds: string[] = [], before?: string, after?: string) => {
     state.revision += 1;
-    state.audit.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), action, detail, recordIds });
+    state.audit.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), action, detail, recordIds, before, after });
     state.audit = state.audit.slice(0, 300);
   };
 
@@ -199,24 +204,17 @@ export default component$(() => {
   const parseImport = $(() => {
     const raw = importRaw.value.trim();
     if (!raw) return;
-    let rows: Array<Partial<ArchiveRecord>> = [];
+    let rows: RevisionRow[] = [];
     try {
-      if (raw.startsWith('[')) rows = JSON.parse(raw) as Array<Partial<ArchiveRecord>>;
+      if (raw.startsWith('[')) rows = (JSON.parse(raw) as Array<Record<string, unknown>>).map(normalizeRow);
       else {
         const lines = raw.split(/\r?\n/).filter(Boolean);
-        rows = lines.map((line, index) => {
+        rows = lines.map((line) => {
           const cells = line.split(/\t|\|/).map((cell) => cell.trim());
-          return {
-            title: cells[0] || `未命名记录 ${index + 1}`,
-            date: cells[1] || '',
-            people: (cells[2] || '').split(/[，,、]/).filter(Boolean),
-            places: (cells[3] || '').split(/[，,、]/).filter(Boolean),
-            identifier: cells[4] || '',
-            medium: cells[5] || '',
-            extent: cells[6] || '',
-            rights: cells[7] || '',
-            notes: cells[8] || ''
-          };
+          return normalizeRow({
+            title: cells[0], date: cells[1], people: cells[2], places: cells[3], identifier: cells[4],
+            medium: cells[5], extent: cells[6], rights: cells[7], notes: cells[8]
+          });
         });
       }
     } catch {
@@ -224,31 +222,49 @@ export default component$(() => {
       return;
     }
     if (!rows.length) return;
+    const now = new Date().toISOString();
+    const source = importText.value || '手动粘贴';
+    const outcome = planRevision(state.records, importGroup.value, rows, now);
+    if (!outcome.ok) {
+      importDuplicates.value = outcome.duplicates;
+      notify(`修订表未导入：发现 ${outcome.duplicates.length} 个重复编号`);
+      return;
+    }
+    importDuplicates.value = [];
+    const { plan } = outcome;
+    if (!plan.added.length && !plan.updated.length) {
+      importRaw.value = '';
+      importText.value = '';
+      importOpen.value = false;
+      notify(`修订表与现有 ${plan.unchanged} 条记录一致，结论全部沿用`);
+      return;
+    }
     capture();
-    rows.forEach((row) => {
-      const record: ArchiveRecord = {
-        id: crypto.randomUUID(),
-        group: importGroup.value,
-        title: row.title || '未命名记录',
-        date: row.date || '',
-        people: Array.isArray(row.people) ? row.people : String(row.people || '').split(/[，,、]/).filter(Boolean),
-        places: Array.isArray(row.places) ? row.places : String(row.places || '').split(/[，,、]/).filter(Boolean),
-        identifier: row.identifier || '',
-        medium: row.medium || '',
-        extent: row.extent || '',
-        rights: row.rights || '',
-        notes: row.notes || '',
-        updatedAt: new Date().toISOString(),
-        status: 'unreviewed'
-      };
-      state.records.push(record);
+    plan.updated.forEach((update) => {
+      const record = recordById(state, update.recordId);
+      if (record) applyUpdate(record, update, now, source);
     });
-    state.matches = computeMatches(state.records);
-    commit('导入档案记录', `从 ${importGroup.value} 组导入 ${rows.length} 条记录`, []);
+    plan.added.forEach((record) => state.records.push(record));
+    const affectedIds = new Set([...plan.updated.map((update) => update.recordId), ...plan.added.map((record) => record.id)]);
+    state.matches = rematchAffected(state.records, state.matches, affectedIds);
+    plan.updated.forEach((update) => {
+      commit(
+        '修订记录',
+        `${update.identifier}：${update.changes.map((change) => fieldLabel(change.field)).join('、')} 有差异，相关匹配退回待复核`,
+        [update.recordId],
+        update.changes.map((change) => `${fieldLabel(change.field)}：${change.before || '（空）'}`).join('\n'),
+        update.changes.map((change) => `${fieldLabel(change.field)}：${change.after || '（空）'}`).join('\n')
+      );
+    });
+    commit(
+      '应用修订表',
+      `${source}：新增 ${plan.added.length} 条、修订 ${plan.updated.length} 条、沿用 ${plan.unchanged} 条结论`,
+      [...affectedIds]
+    );
     importRaw.value = '';
     importText.value = '';
     importOpen.value = false;
-    notify(`已导入 ${rows.length} 条记录并重新匹配`);
+    notify(`修订完成：新增 ${plan.added.length} 条、修订 ${plan.updated.length} 条、沿用 ${plan.unchanged} 条`);
   });
 
   const importFile = $(async (_event: Event, element: HTMLInputElement) => {
@@ -256,6 +272,7 @@ export default component$(() => {
     if (!file) return;
     importRaw.value = await file.text();
     importText.value = file.name;
+    importDuplicates.value = [];
   });
 
   const exportAudit = $(() => {
@@ -306,7 +323,7 @@ export default component$(() => {
         return;
       }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'y') { event.preventDefault(); redo(); return; }
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'i') { event.preventDefault(); importOpen.value = true; return; }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'i') { event.preventDefault(); importDuplicates.value = []; importOpen.value = true; return; }
       if (editing) return;
       const key = event.key.toLowerCase();
       if (key === 'j') { event.preventDefault(); moveReview(1); }
@@ -331,7 +348,7 @@ export default component$(() => {
         <div class="top-actions">
           <button class="icon-button" disabled={!history.value.length} onClick$={undo}>撤销</button>
           <button class="icon-button" disabled={!future.value.length} onClick$={redo}>重做</button>
-          <button class="button ghost" onClick$={() => importOpen.value = true}>导入两组记录</button>
+          <button class="button ghost" onClick$={() => { importDuplicates.value = []; importOpen.value = true; }}>导入记录 / 修订表</button>
           <button class="button light" onClick$={exportAudit}>导出核对包</button>
         </div>
       </header>
@@ -414,12 +431,34 @@ export default component$(() => {
           <div class="record-table">
             <div class="table-head"><span>来源</span><span>标题</span><span>日期 / 人物 / 地点</span><span>编号</span><span>状态</span></div>
             {filteredRecords.value.map((record) => (
-              <div class="table-row" key={record.id}>
-                <span class={`group-badge ${record.group.toLowerCase()}`}>{record.group}</span>
-                <strong>{record.title}</strong>
-                <span>{parseDate(record.date)}<small>{record.people.join('、')} · {record.places.join('、')}</small></span>
-                <code>{record.identifier}</code>
-                <span class={`record-status ${record.status}`}>{record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : '已合并'}</span>
+              <div class="record-block" key={record.id}>
+                <div
+                  class={`table-row ${record.revision ? 'revised' : ''}`}
+                  title={record.revision ? '点击查看本次修订的改前改后' : undefined}
+                  onClick$={() => { if (record.revision) expandedRecordId.value = expandedRecordId.value === record.id ? '' : record.id; }}
+                >
+                  <span class={`group-badge ${record.group.toLowerCase()}`}>{record.group}</span>
+                  <strong>{record.title}</strong>
+                  <span>{parseDate(record.date)}<small>{record.people.join('、')} · {record.places.join('、')}</small></span>
+                  <code>{record.identifier}</code>
+                  <span class="record-status-cell">
+                    <span class={`record-status ${record.status}`}>{record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : '已合并'}</span>
+                    {record.revision && <span class="revision-badge">修订 {record.revision.changes.length} 项 {expandedRecordId.value === record.id ? '▲' : '▼'}</span>}
+                  </span>
+                </div>
+                {record.revision && expandedRecordId.value === record.id && (
+                  <div class="revision-detail">
+                    <div class="revision-meta">改前 → 改后 · 来源：{record.revision.source} · {new Date(record.revision.at).toLocaleString('zh-CN')}</div>
+                    {record.revision.changes.map((change) => (
+                      <div class="revision-change" key={change.field}>
+                        <span class="revision-field">{fieldLabel(change.field)}</span>
+                        <span class="revision-before">{change.before || '（空）'}</span>
+                        <span class="revision-arrow">→</span>
+                        <span class="revision-after">{change.after || '（空）'}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -468,7 +507,8 @@ export default component$(() => {
           <p>标题、日期、人物、地点和编号按权重综合评分。低于 68% 的候选会以红色标记，但系统不会替研究者自动决定。</p>
           <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
           <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
-          <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
+          <div class="rule-row"><span>3</span><p>修订表按分组与编号对应原记录，只写入差异字段并保留改前改后；有变更的匹配退回待复核，无变化的结论沿用。</p></div>
+          <div class="rule-row"><span>4</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
         </article>
       </section>
 
@@ -476,16 +516,25 @@ export default component$(() => {
 
       <Modal.Root bind:show={importOpen} closeOnBackdropClick>
         <Modal.Panel class="modal-panel import-modal">
-          <Modal.Header class="modal-header"><div><span class="eyebrow">IMPORT</span><Modal.Title>导入一组档案记录</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
-          <Modal.Description class="modal-description">支持 JSON 数组或制表符 / 竖线分隔文本。字段顺序：标题、日期、人物、地点、编号、载体、数量、权利、备注。</Modal.Description>
+          <Modal.Header class="modal-header"><div><span class="eyebrow">IMPORT</span><Modal.Title>导入档案记录 / 修订表</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
+          <Modal.Description class="modal-description">支持 JSON 数组或制表符 / 竖线分隔文本。字段顺序：标题、日期、人物、地点、编号、载体、数量、权利、备注。同一分组与编号会对应到原记录，只写入有差异的字段；无变化的复核结论继续沿用，新编号自动新增。同一文件内编号重复时整份不会导入。</Modal.Description>
           <div class="import-controls">
-            <label class="radio-card"><input type="radio" checked={importGroup.value === 'A'} onChange$={() => importGroup.value = 'A'} /><span><strong>A 组</strong><small>口述史 / 主要记录</small></span></label>
-            <label class="radio-card"><input type="radio" checked={importGroup.value === 'B'} onChange$={() => importGroup.value = 'B'} /><span><strong>B 组</strong><small>手稿 / 待合并记录</small></span></label>
+            <label class="radio-card"><input type="radio" checked={importGroup.value === 'A'} onChange$={() => { importGroup.value = 'A'; importDuplicates.value = []; }} /><span><strong>A 组</strong><small>口述史 / 主要记录</small></span></label>
+            <label class="radio-card"><input type="radio" checked={importGroup.value === 'B'} onChange$={() => { importGroup.value = 'B'; importDuplicates.value = []; }} /><span><strong>B 组</strong><small>手稿 / 待合并记录</small></span></label>
             <label class="file-button">选择文件<input type="file" accept=".json,.txt,.csv,.tsv" onChange$={(event, element) => importFile(event, element)} /></label>
           </div>
-          <textarea class="modal-textarea" value={importRaw.value} onInput$={(event) => importRaw.value = (event.target as HTMLTextAreaElement).value} placeholder="李秀珍口述史访谈 | 2019-04-12 | 李秀珍、周明远 | 临河县 | OH-LXZ-2019-01 | 数字录音 | 02:14:38 | 研究者授权 | ..." />
+          <textarea class="modal-textarea" value={importRaw.value} onInput$={(event) => { importRaw.value = (event.target as HTMLTextAreaElement).value; importDuplicates.value = []; }} placeholder="李秀珍口述史访谈 | 2019-04-12 | 李秀珍、周明远 | 临河县 | OH-LXZ-2019-01 | 数字录音 | 02:14:38 | 研究者授权 | ..." />
           {importText.value && <div class="file-name">已读取：{importText.value}</div>}
-          <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" disabled={!importRaw.value.trim()} onClick$={parseImport}>导入并重新匹配</button></Modal.Footer>
+          {importDuplicates.value.length > 0 && (
+            <div class="import-error">
+              <strong>修订表未进入工作台：同一文件内编号重复</strong>
+              <ul>
+                {importDuplicates.value.map((duplicate) => <li key={duplicate.identifier}>编号「{duplicate.identifier}」重复出现在第 {duplicate.rows.join('、')} 行</li>)}
+              </ul>
+              <p>请修正后重新提交，整份修订表会一起校验、一起导入。</p>
+            </div>
+          )}
+          <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" disabled={!importRaw.value.trim()} onClick$={parseImport}>导入 / 应用修订</button></Modal.Footer>
         </Modal.Panel>
       </Modal.Root>
 

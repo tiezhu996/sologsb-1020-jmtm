@@ -2,6 +2,18 @@ export type RecordGroup = 'A' | 'B';
 export type MatchStatus = 'suggested' | 'confirmed' | 'rejected' | 'merged';
 export type FieldKey = 'title' | 'date' | 'people' | 'places' | 'identifier' | 'medium' | 'extent' | 'rights' | 'notes';
 
+export interface RevisionChange {
+  field: FieldKey;
+  before: string;
+  after: string;
+}
+
+export interface RecordRevision {
+  at: string;
+  source: string;
+  changes: RevisionChange[];
+}
+
 export interface ArchiveRecord {
   id: string;
   group: RecordGroup;
@@ -16,6 +28,7 @@ export interface ArchiveRecord {
   notes: string;
   updatedAt: string;
   status: 'unreviewed' | 'confirmed' | 'rejected' | 'merged';
+  revision?: RecordRevision;
 }
 
 export interface MatchCandidate {
